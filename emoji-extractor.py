@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""🍎 Emoji Extractor by Alek Borisov (Complete, including dupe/flip)"""
+"""🍎 Emoji Extractor by Alek Borisov"""
 
 import sys, io, re, hashlib, codecs, unicodedata, signal, urllib.request, warnings, argparse, plistlib
 from pathlib            import Path
