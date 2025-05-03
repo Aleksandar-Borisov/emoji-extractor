@@ -105,7 +105,7 @@ OUT  = Path.cwd() / "Emojis"
 CPU  = cpu_count() or 4
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
-HEX   = re.compile(r"([A-F0-9]{4,8})")
+HEX   = re.compile(r"([0-9A-Fa-f]{4,8})")
 LZHD  = b"bvx0"
 VS    = ("\uFE0E","\uFE0F")
 SKIN  = tuple(chr(x) for x in range(0x1F3FB,0x1F400))
@@ -239,7 +239,8 @@ def main():
             if kind == "ok":
                 tg, gname, data, img = pl
                 seq  = codecs.decode("".join(esc(c) for c in HEX.findall(gname)), "unicode_escape")
-                name = seq if cldr(seq)==seq else f"{seq} {cldr(seq)}"
+                # ── Only change here: drop the emoji itself, use just the name
+                name = cldr(seq)
                 if tg=="flip": name += " Mirror"
                 dst = uniq(OUT/f"{img.width}x{img.height}"/f"{safe(name)}.png", data, tg=="flip")
                 if gname not in written:
