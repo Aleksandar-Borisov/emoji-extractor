@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""🍎 Emoji Extractor by Alek Borisov"""
+"""🍎 Emoji Extractor by Alek Borisov (Complete, including dupe/flip)"""
 
 import sys, io, re, hashlib, codecs, unicodedata, signal, urllib.request, warnings, argparse, plistlib
 from pathlib            import Path
-from multiprocessing     import Process, Queue, cpu_count
 from typing             import Dict, Tuple, Optional
 
 import pyfiglet
@@ -18,14 +17,17 @@ from rich               import box
 from PIL                import Image, ImageFile, ImageOps
 from fontTools.ttLib    import TTCollection
 
-# ── Optional LZFSE‐compressed emoji support
+# ── Optional LZFSE support ───────────────────────────────────────────────
 for m in ("lzfse","liblzfse","pyliblzfse"):
-    try: LZFSE = __import__(m); break
-    except ModuleNotFoundError: LZFSE = None
+    try:
+        LZFSE = __import__(m)
+        break
+    except ModuleNotFoundError:
+        LZFSE = None
 if LZFSE is None:
     sys.exit("❌ Install pyliblzfse for .emjc support")
 
-# ── HEIC/HEIF support
+# ── HEIC/HEIF support ────────────────────────────────────────────────────
 from pillow_heif import register_heif_opener
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="pillow_heif")
 register_heif_opener()
@@ -33,7 +35,7 @@ register_heif_opener()
 # ── CLI & Theming ──────────────────────────────────────────────────────
 parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument("--theme", choices=["orange","mono","high-contrast"], default="orange")
-parser.add_argument("-h","--help",    action="store_true")
+parser.add_argument("-h","--help", action="store_true")
 args, _ = parser.parse_known_args()
 if args.help:
     Console().print(Markdown(__doc__))
@@ -47,28 +49,110 @@ PALETTES = {
 palette      = PALETTES[args.theme]
 rainbow_iter = iter(lambda: palette.append(palette.pop(0)) or palette[0], None)
 
-# ── Load Apple’s human-friendly emoji names
+# ── Load Apple’s CLDR names ───────────────────────────────────────────────
 APPLE_NAMES: Dict[str,str] = {}
 strings_path = Path(
     "/System/Library/PrivateFrameworks/CoreEmoji.framework/"
     "Versions/A/Resources/en.lproj/AppleName.strings"
 )
 def normalize_seq(s: str) -> str:
-    for ch in ("\uFE0E","\uFE0F","\u200D","\u20E3"):
-        s = s.replace(ch, "")
-    return s
+    return s.replace("\uFE0E","").replace("\uFE0F","").replace("\u200D","").replace("\u20E3","")
 
 if strings_path.exists():
     try:
         raw = plistlib.load(strings_path.open("rb"))
-        for k, v in raw.items():
-            name = v.decode() if isinstance(v, bytes) else v
+        for k,v in raw.items():
+            name = v.decode() if isinstance(v,bytes) else v
             APPLE_NAMES[k] = name
             APPLE_NAMES[normalize_seq(k)] = name
     except Exception:
         APPLE_NAMES.clear()
 
-# ── Banner & Gradient ASCII ─────────────────────────────────────────────
+def cldr(seq: str) -> str:
+    if seq in APPLE_NAMES:
+        return APPLE_NAMES[seq]
+    norm = normalize_seq(seq)
+    if norm in APPLE_NAMES:
+        return APPLE_NAMES[norm]
+    parts = [unicodedata.name(ch,"") for ch in norm]
+    return " ".join(parts).title() if any(parts) else "Unnamed"
+
+# ── Helpers & Constants ─────────────────────────────────────────────────
+HEX    = re.compile(r"([0-9A-Fa-f]{4,8})")
+LZHD   = b"bvx0"
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+
+def esc(h: str) -> str:
+    return f"\\U{int(h,16):08X}"
+
+def safe(txt: str, lim=140) -> str:
+    s = "".join(c for c in unicodedata.normalize("NFKD", txt)
+                if c.isprintable() and c not in '/\\:*?"<>|').strip()
+    return (s or "unnamed")[:lim]
+
+def uniq(dst: Path, blob: bytes) -> Path:
+    if not dst.exists():
+        return dst
+    h = hashlib.sha1(blob).hexdigest()[:8]
+    base = dst.with_name(f"{dst.stem}-{h}{dst.suffix}")
+    i = 1
+    while base.exists():
+        base = dst.with_name(f"{dst.stem}-{h}_{i}{dst.suffix}")
+        i += 1
+    return base
+
+def dec_emjc(b: bytes) -> bytes:
+    if not b.startswith(LZHD):
+        raise RuntimeError("Not an emjc blob")
+    return LZFSE.decompress(b)
+
+# ── Extraction logic ─────────────────────────────────────────────────────
+def extract_glyph(strike, gid, cache) -> Optional[Tuple[bytes, Image.Image]]:
+    """
+    Recursively extract image data + PIL image for a glyph:
+    - direct types via DECODERS
+    - dupe: same as reference
+    - flip: mirror of reference
+    """
+    if gid in cache:
+        return cache[gid]
+
+    glyph = strike.glyphs[gid]
+    tg    = glyph.graphicType
+    # Direct decoders
+    if tg in DECODERS:
+        data = DECODERS[tg](glyph.imageData)
+        img  = Image.open(io.BytesIO(data)); img.load()
+    elif tg in ("dupe","flip"):
+        # find the reference gid by name
+        ref_name = glyph.referenceGlyphName
+        ref_gid = next(k for k,g in strike.glyphs.items() if g.glyphName==ref_name)
+        ref = extract_glyph(strike, ref_gid, cache)
+        if not ref:
+            return None
+        data, img = ref
+        if tg=="flip":
+            img = ImageOps.mirror(img)
+            buf = io.BytesIO(); img.save(buf,"PNG"); data = buf.getvalue()
+    else:
+        return None
+
+    cache[gid] = (data, img)
+    return cache[gid]
+
+# ── DECODER MAP ─────────────────────────────────────────────────────────
+DECODERS = {
+    "png ": lambda b: b,
+    "jpg ": lambda b: b,
+    "tiff": lambda b: b,
+    "heic": lambda b: b,
+    "avif": lambda b: b,
+    "pdf ": lambda b: b,
+    "mask": lambda b: b,
+    "emjc": dec_emjc,
+}
+
+# ── Banner ───────────────────────────────────────────────────────────────
 def render_ascii(text: str) -> Group:
     art = pyfiglet.figlet_format(text, font="slant")
     rows = []
@@ -80,178 +164,63 @@ def render_ascii(text: str) -> Group:
     return Group(*rows)
 
 def banner() -> Panel:
-    inner = Panel(
-        render_ascii("Emoji Extractor"),
-        border_style=next(rainbow_iter),
-        box=box.DOUBLE,
-        padding=(0,1),
-    )
     return Panel(
-        inner,
+        Panel(render_ascii("Emoji Extractor"),
+              border_style=next(rainbow_iter),
+              box=box.DOUBLE,
+              padding=(0,1)),
         border_style=Style(dim=True),
         box=box.ROUNDED,
         padding=(1,2),
     )
 
-# ── Custom Gradient Progress Bar ────────────────────────────────────────
-class GradientBar(BarColumn):
-    def render(self, task):
-        self.style = Style(color=next(rainbow_iter))
-        return super().render(task)
-
-# ── Extraction Constants & Helpers ──────────────────────────────────────
-TTC  = Path("/System/Library/Fonts/Apple Color Emoji.ttc")
-OUT  = Path.cwd() / "Emojis"
-CPU  = cpu_count() or 4
-ImageFile.LOAD_TRUNCATED_IMAGES = True
-
-HEX   = re.compile(r"([0-9A-Fa-f]{4,8})")
-LZHD  = b"bvx0"
-VS    = ("\uFE0E","\uFE0F")
-SKIN  = tuple(chr(x) for x in range(0x1F3FB,0x1F400))
-ZJW   = "\u200D"
-STRIP = dict.fromkeys(ord(c) for c in VS + SKIN + (ZJW,))
-
-LABEL: Dict[str,str] = {}
-def cldr(seq: str) -> str:
-    if seq in APPLE_NAMES:
-        return APPLE_NAMES[seq]
-    norm = normalize_seq(seq)
-    if norm in APPLE_NAMES:
-        return APPLE_NAMES[norm]
-    if not LABEL:
-        try:
-            data = urllib.request.urlopen(
-                "https://unicode.org/Public/emoji/latest/emoji-test.txt",
-                timeout=10
-            ).read().decode()
-            for row in data.splitlines():
-                if "; fully-qualified" not in row: continue
-                cps  = row.split(";",1)[0].strip()
-                name = row.split("#",1)[1].split(" E",1)[0].strip().title()
-                LABEL["".join(chr(int(c,16)) for c in cps.split())] = name
-        except Exception:
-            LABEL.clear()
-    if seq in LABEL:
-        return LABEL[seq]
-    if norm in LABEL:
-        return LABEL[norm]
-    parts = [unicodedata.name(ch, "") for ch in norm]
-    return " ".join(parts).title() if parts else "Unnamed"
-
-def esc(h: str) -> str:
-    return f"\\U{int(h,16):08X}"
-
-def safe(txt: str, lim=140) -> str:
-    s = "".join(
-        c for c in unicodedata.normalize("NFKD", txt)
-        if c.isprintable() and c not in '/\\:*?"<>|'
-    ).strip()
-    return (s or "unnamed")[:lim]
-
-def uniq(dst: Path, blob: bytes, force=False) -> Path:
-    if not dst.exists() and not force:
-        return dst
-    h    = hashlib.sha1(blob).hexdigest()[:8]
-    base = dst.with_name(f"{dst.stem} - {h}{dst.suffix}")
-    i = 0
-    while base.exists():
-        i += 1
-        base = base.with_name(f"{dst.stem} - {h}_{i}{dst.suffix}")
-    return base
-
-def gtag(raw) -> Optional[str]:
-    return None if raw is None else (
-        raw.decode() if isinstance(raw,(bytes,bytearray)) else raw
-    )
-
-def dec_emjc(b: bytes) -> bytes:
-    if not b.startswith(LZHD):
-        raise RuntimeError
-    return LZFSE.decompress(b)
-
-DEC = {k:(lambda b:b) for k in ("png ","jpg ","tiff","heic","avif","pdf ","mask")}
-DEC["emjc"] = dec_emjc
-
-# ── Worker & Orchestrator ───────────────────────────────────────────────
-def worker(ttc_bytes: bytes, q: Queue, r: Queue):
-    font    = TTCollection(io.BytesIO(ttc_bytes)).fonts[0]
-    strikes = font["sbix"].strikes
-    cache: Dict[int,Tuple[bytes,Image.Image]] = {}
-    for job in iter(q.get, None):
-        gid, sz = job
-        glyph   = strikes[sz].glyphs[gid]
-        tg      = gtag(glyph.graphicType)
-        try:
-            if tg in DEC:
-                data = DEC[tg](glyph.imageData)
-                img  = Image.open(io.BytesIO(data)); img.load()
-            elif tg in ("dupe","flip"):
-                ref_gid = next(k for k,g in strikes[sz].glyphs.items()
-                              if g.glyphName==glyph.referenceGlyphName)
-                data, img = cache[ref_gid]
-                if tg=="flip":
-                    img = ImageOps.mirror(img)
-                    buf = io.BytesIO(); img.save(buf,"PNG"); data=buf.getvalue()
-            else:
-                raise RuntimeError
-            cache[gid] = (data, img)
-            r.put(("ok", tg, glyph.glyphName, data, img))
-        except Exception as e:
-            r.put(("skip", str(e)))
-    r.put(("done",))
-
+# ── Main ─────────────────────────────────────────────────────────────────
 def main():
+    TTC = Path("/System/Library/Fonts/Apple Color Emoji.ttc")
     if not TTC.exists():
         sys.exit("Emoji font not found")
+    OUT = Path.cwd() / "Emojis"
     OUT.mkdir(exist_ok=True)
+
     console = Console()
     console.print(banner())
 
     ttc_bytes = TTC.read_bytes()
-    strikes   = TTCollection(TTC).fonts[0]["sbix"].strikes
-    tasks     = [(gid, sz) for sz, st in strikes.items() for gid in st.glyphs]
+    font      = TTCollection(io.BytesIO(ttc_bytes)).fonts[0]
+    strikes   = font["sbix"].strikes      # {size: Strike}
 
-    q, r = Queue(8192), Queue()
-    for _ in range(CPU := cpu_count() or 4):
-        Process(target=worker, args=(ttc_bytes, q, r)).start()
-    for t in tasks:      q.put(t)
-    for _ in range(CPU): q.put(None)
-
+    total = sum(len(strike.glyphs) for strike in strikes.values())
     progress = Progress(
         SpinnerColumn(style=palette[0]),
-        TextColumn("[bold]{task.description}", style=palette[0]),
-        GradientBar(bar_width=None),
+        TextColumn("[bold]{task.description}"),
+        BarColumn(),
         TaskProgressColumn(),
         TimeElapsedColumn(),
         console=console,
     )
-    tid = progress.add_task("✨ Extracting…", total=len(tasks))
-    written: Dict[str, Path] = {}
-    done = 0
+    task_id = progress.add_task("Extracting…", total=total)
 
     with progress:
-        while done < CPU:
-            kind, *pl = r.get()
-            if kind == "done":
-                done += 1; continue
-            progress.advance(tid)
-            if kind == "ok":
-                tg, gname, data, img = pl
-                seq  = codecs.decode("".join(esc(c) for c in HEX.findall(gname)), "unicode_escape")
-                # ── Only change here: drop the emoji itself, use just the name
+        for size, strike in strikes.items():
+            folder = OUT / f"{size}x{size}"
+            folder.mkdir(exist_ok=True)
+            cache: Dict[int,Tuple[bytes,Image.Image]] = {}
+            for gid in strike.glyphs:
+                result = extract_glyph(strike, gid, cache)
+                if not result:
+                    progress.advance(task_id)
+                    continue
+                data, img = result
+                # build filename
+                seq = codecs.decode("".join(esc(c) for c in HEX.findall(strike.glyphs[gid].glyphName)), "unicode_escape")
                 name = cldr(seq)
-                if tg=="flip": name += " Mirror"
-                dst = uniq(OUT/f"{img.width}x{img.height}"/f"{safe(name)}.png", data, tg=="flip")
-                if gname not in written:
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    dst.write_bytes(data)
-                    written[gname] = dst
+                filename = safe(name) + ".png"
+                dst = uniq(folder/filename, data)
+                dst.write_bytes(data)
+                progress.advance(task_id)
 
-    console.print(
-        Panel(f"☑  Done – {len(written)} PNGs → {OUT}",
-              style=Style(color=palette[0]))
-    )
+    console.print(Panel(f"☑  Done – wrote {total} PNGs → {OUT}",
+                        style=Style(color=palette[0])))
 
 signal.signal(signal.SIGINT, lambda *_: sys.exit("\nInterrupted."))
 if __name__=="__main__":
