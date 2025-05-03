@@ -1,4 +1,4 @@
-🍎 **Emoji Extractor** by Alek Borisov
+# 🍎 **Emoji Extractor** by Alek Borisov
 
 A command-line tool that extracts every color emoji glyph from the system font into individual PNG files, with a beautiful, orange-themed user interface—without ever touching your global Python installation or Xcode setup.
 
