@@ -16,7 +16,7 @@ A command-line tool that extracts every color emoji glyph from the system font i
 ## ⚙️ Installation & Usage
 
 ```bash
-git clone https://github.com/<your-username>/emoji-extractor.git
+git clone https://github.com/Aleksandar-Borisov/emoji-extractor.git
 cd emoji-extractor
 bash run-extract.txt
 ```
