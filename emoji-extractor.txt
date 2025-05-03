@@ -1,0 +1,7 @@
+python3 -m venv "Emojis - temp"
+source "Emojis - temp/bin/activate"
+pip install --upgrade pip wheel
+pip install "pillow>=11.2" "fonttools>=4.57" pillow-heif pyliblzfse rich pyfiglet
+python emoji-extractor.py --theme orange
+deactivate
+rm -rf "Emojis - temp"
