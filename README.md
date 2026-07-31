@@ -18,7 +18,7 @@ A command-line tool that extracts every color emoji glyph from the system font i
 ```bash
 git clone https://github.com/Aleksandar-Borisov/emoji-extractor.git
 cd emoji-extractor
-bash run-extract.txt
+bash emoji-extractor.txt
 ```
 
 - **Virtual environment** will appear as `Emojis - temp/` next to the script.  
